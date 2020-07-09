@@ -1,0 +1,7 @@
+*.gch
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+*.so*
+build/
+example.h5
