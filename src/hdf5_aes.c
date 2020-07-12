@@ -1,5 +1,6 @@
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <openssl/conf.h>
 #include <openssl/evp.h>
@@ -13,7 +14,6 @@
 #define AES_BLOCK_SIZE 16
 #define AES_256_KEY_LENGTH 32
 
-#define ENV_HDF5_AES_IV "HDF5_AES_IV"
 #define ENV_HDF5_AES_KEY "HDF5_AES_KEY"
 
 #define MIN(a,b) (((a)<(b))?(a):(b))
@@ -23,10 +23,10 @@ static size_t aes_filter(unsigned int flags, size_t cd_nelmts,
         void **buf);
 
 int encrypt(size_t src_len, unsigned char *src, unsigned char *dest,
-            unsigned char * key, unsigned char * iv);
+            unsigned char * key);
 int decrypt(size_t src_len, unsigned char *src, unsigned char *dest,
-            unsigned char * key, unsigned char * iv);
-int on_error(EVP_CIPHER_CTX *ctx);
+            unsigned char * key);
+unsigned char* generate_random_block(unsigned char* block);
 
 const H5Z_class2_t FILTER_TEMPLATE_CLASS[1] = {{
     H5Z_CLASS_T_VERS,
@@ -40,122 +40,128 @@ const H5Z_class2_t FILTER_TEMPLATE_CLASS[1] = {{
 }};
 
 H5PL_type_t H5PLget_plugin_type(void) { return H5PL_TYPE_FILTER; }
-const void *H5PLget_plugin_info(void) { return FILTER_TEMPLATE_CLASS; }
+const void *H5PLget_plugin_info(void) { srand(time(0)); return FILTER_TEMPLATE_CLASS; }
 
 static size_t
 aes_filter(unsigned int flags, size_t cd_nelmts,
         const unsigned int cd_values[], size_t nbytes, size_t *buf_size,
         void **buf)
 {
-    int res;
+    /* pointers */
     void *dest = NULL;
-    dest = H5allocate_memory(nbytes + AES_BLOCK_SIZE, true); /* Add 16 bytes for padding */
-    char *env_var;
+    void *src_ = NULL;
+    unsigned char * key = NULL;
 
-    if (NULL == (env_var = getenv(ENV_HDF5_AES_IV))) {
-        printf("HDF5_AES_IV NOT SET\n");
-        return 0;
-    }
-    unsigned char * iv = (unsigned char *)calloc(AES_BLOCK_SIZE, sizeof(unsigned char));
-    memcpy(iv, env_var, MIN(AES_BLOCK_SIZE, strlen(env_var)));
+    char *env_var;
+    int res;
 
     if(NULL == (env_var = getenv(ENV_HDF5_AES_KEY))) {
-        printf("HDF5_AES_KEY NOT SET\n");
-        return 0;
+        printf("ERROR: %s VARIABLE NOT SET. DATA WILL NOT BE SAVED!\n", ENV_HDF5_AES_KEY);
+        goto done;
     }
-    unsigned char * key = (unsigned char *)calloc(AES_256_KEY_LENGTH, sizeof(unsigned char));
+
+    key = (unsigned char *)H5allocate_memory(AES_256_KEY_LENGTH * sizeof(unsigned char), true);
+    if (key == NULL)
+        goto done;
     memcpy(key, env_var, MIN(AES_256_KEY_LENGTH, strlen(env_var)));
 
     if (flags & H5Z_FLAG_REVERSE)
     {
-        res = decrypt(nbytes, (unsigned char *)*buf, (unsigned char *)dest, key, iv);
+        /* decrypt */
+        if (NULL == (dest = H5allocate_memory(nbytes, false)))
+            goto done;
+        if (AES_BLOCK_SIZE > (res = decrypt(nbytes, (unsigned char *)*buf, (unsigned char *)dest, key)))
+            goto done;
+        /* discard first block */
+        memmove(dest, (char *)dest + AES_BLOCK_SIZE, res - AES_BLOCK_SIZE);
+        res -= AES_BLOCK_SIZE;
     }
     else
     {
-        res = encrypt(nbytes, (unsigned char *)*buf, (unsigned char *)dest, key, iv);
+        /* encrypt */
+        if (NULL == (src_ = H5allocate_memory(nbytes + AES_BLOCK_SIZE, false)))
+            goto done;
+        memcpy((char *)src_ + AES_BLOCK_SIZE, *buf, nbytes);
+        /* additional room for (iv || chunk || padding) */
+        if (NULL == (dest = H5allocate_memory(nbytes + 2*AES_BLOCK_SIZE, false)))
+            goto done;
+        if (!(res = encrypt(nbytes + AES_BLOCK_SIZE, (unsigned char *)src_, (unsigned char *)dest, key)))
+            goto done;
     }
 
-    if (res)
-    {
-        free(*buf);
-        *buf = dest;
-    }
+    /* repoint *buf to (en|de)crypted block */
+    H5free_memory(*buf);
+    *buf = dest;
 
+done:
+    H5free_memory(key);
+    H5free_memory(src_);
     return res;
 }
 
-int on_error(EVP_CIPHER_CTX *ctx)
+unsigned char* generate_random_block(unsigned char* block)
 {
-  if (ctx != NULL)
-  {
-      EVP_CIPHER_CTX_free(ctx);
-  }
-  return 0;
+    for (int i = 0; i < AES_BLOCK_SIZE; i++)
+    {
+        block[i] = (unsigned char) rand() % 256;
+    }
+    return block;
 }
 
 int encrypt(size_t src_len, unsigned char *src, unsigned char *dest,
-            unsigned char * key, unsigned char * iv)
+            unsigned char * key)
 {
+    EVP_CIPHER_CTX *ctx;
+    unsigned char * iv = NULL;
+
     int len = 0;
     int ciphertext_len = 0;
 
-    EVP_CIPHER_CTX *ctx;
+    iv = (unsigned char*) H5allocate_memory(AES_BLOCK_SIZE * sizeof(unsigned char), false);
+    if (iv == NULL)
+        goto done;
+    generate_random_block(iv);
 
     if (!(ctx = EVP_CIPHER_CTX_new()))
-    {
-        return on_error(ctx);
-    }
+        goto done;
     if (1 != EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv))
-    {
-        return on_error(ctx);
-    }
+        goto done;
     if(1 != EVP_EncryptUpdate(ctx, dest, &len, src, src_len))
-    {
-        return on_error(ctx);
-    }
+        goto done;
     ciphertext_len = len;
-
     if(1 != EVP_EncryptFinal_ex(ctx, dest + len, &len))
-    {
-        return on_error(ctx);
-    }
+        goto done;
     ciphertext_len += len;
+
+done:
+    H5free_memory(iv);
     EVP_CIPHER_CTX_free(ctx);
 
     return ciphertext_len;
 }
 
 int decrypt(size_t src_len, unsigned char *src, unsigned char *dest,
-            unsigned char * key, unsigned char * iv)
+            unsigned char * key)
 {
+    /* iv is irrelevant as first block is discarded */
+    unsigned char iv[AES_BLOCK_SIZE] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    EVP_CIPHER_CTX *ctx;
+
     int len;
     int plaintext_len;
 
-    EVP_CIPHER_CTX *ctx;
     if(!(ctx = EVP_CIPHER_CTX_new()))
-    {
-        printf("EVP_CIPHER_CTX_new\n");
-        return on_error(ctx);
-    }
+        goto done;
     if(1 != EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv))
-    {
-        printf("EVP_DecryptInit_ex\n");
-        return on_error(ctx);
-    }
+        goto done;
     if(1 != EVP_DecryptUpdate(ctx, dest, &len, src, src_len))
-    {
-        printf("EVP_DecryptUpdate\n");
-        return on_error(ctx);
-    }
+        goto done;
     plaintext_len = len;
-
     if(1 != EVP_DecryptFinal_ex(ctx, dest + len, &len))
-    {
-        printf("EVP_DecryptFinal_ex\n");
-        ERR_print_errors_fp(stderr);
-        return on_error(ctx);
-    }
+        goto done;
     plaintext_len += len;
+
+done:
     EVP_CIPHER_CTX_free(ctx);
 
     return plaintext_len;
